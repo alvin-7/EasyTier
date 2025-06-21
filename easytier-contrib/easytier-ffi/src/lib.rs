@@ -7,6 +7,10 @@ use easytier::{
     launcher::ConfigSource,
 };
 
+// iOS 特定绑定
+#[cfg(target_os = "ios")]
+mod ios_bindings;
+
 static INSTANCE_NAME_ID_MAP: once_cell::sync::Lazy<DashMap<String, uuid::Uuid>> =
     once_cell::sync::Lazy::new(DashMap::new);
 static INSTANCE_MANAGER: once_cell::sync::Lazy<NetworkInstanceManager> =
