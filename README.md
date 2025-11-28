@@ -59,7 +59,7 @@ cargo install --git https://github.com/EasyTier/EasyTier.git easytier
 # See https://easytier.cn/en/guide/installation.html#installation-methods
 
 # 4. Linux Quick Install
-wget -O- https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh | sudo bash
+wget -O- https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh | sudo bash -s install
 
 # 5. MacOS via Homebrew
 brew tap brewforge/chinese
@@ -105,9 +105,9 @@ After successful execution, you can check the network status using `easytier-cli
 ```text
 | ipv4         | hostname       | cost  | lat_ms | loss_rate | rx_bytes | tx_bytes | tunnel_proto | nat_type | id         | version         |
 | ------------ | -------------- | ----- | ------ | --------- | -------- | -------- | ------------ | -------- | ---------- | --------------- |
-| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.0-70e69a38~ |
-| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.0-70e69a38~ |
-|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.0-70e69a38~ |
+| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.5-70e69a38~ |
+| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.5-70e69a38~ |
+|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.5-70e69a38~ |
 ```
 
 You can test connectivity between nodes:
@@ -280,13 +280,14 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 - [ZeroTier](https://www.zerotier.com/): A global virtual network for connecting devices.
 - [TailScale](https://tailscale.com/): A VPN solution aimed at simplifying network configuration.
-- [vpncloud](https://github.com/dswd/vpncloud): A P2P Mesh VPN
-- [Candy](https://github.com/lanthora/candy): A reliable, low-latency, and anti-censorship virtual private network
 
 ### Contact Us
 
 - 💬 **[Telegram Group](https://t.me/easytier)**
-- 👥 **[QQ Group: 949700262](https://qm.qq.com/cgi-bin/qm/qr?k=kC8YJ6Jb8vWJIDbZrZJB8pB5YZgPJA5-)**
+- 👥 **[QQ Group]**
+  - No.1 [949700262](https://qm.qq.com/q/wFoTUChqZW)
+  - No.2 [837676408](https://qm.qq.com/q/4V33DrfgHe)
+  - No.3 [957189589](https://qm.qq.com/q/YNyTQjwlai)
 
 ## License
 
@@ -302,13 +303,17 @@ CDN acceleration and security protection for this project are sponsored by Tence
   </a>
 </p>
 
-Special thanks to [Langlang Cloud](https://langlang.cloud/) for sponsoring our public servers.
+Special thanks to [Langlang Cloud](https://langlangy.cn/?i26c5a5)  and [RainCloud](https://www.rainyun.com/NjM0NzQ1_) for sponsoring our public servers.
 
 <p align="center">
 <a href="https://langlangy.cn/?i26c5a5" target="_blank">
 <img src="assets/langlang.png" width="200">
 </a>
+<a href="https://langlangy.cn/?i26c5a5" target="_blank">
+<img src="assets/raincloud.png" width="200">
+</a>
 </p>
+
 
 If you find EasyTier helpful, please consider sponsoring us. Software development and maintenance require a lot of time and effort, and your sponsorship will help us better maintain and improve EasyTier.
 

@@ -59,7 +59,7 @@ cargo install --git https://github.com/EasyTier/EasyTier.git easytier
 # 参见 https://easytier.cn/guide/installation.html#%E5%AE%89%E8%A3%85%E6%96%B9%E5%BC%8F
 
 # 4. Linux 快速安装
-wget -O- https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh | sudo bash
+wget -O- https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh | sudo bash -s install
 
 # 5. MacOS 通过 Homebrew 安装
 brew tap brewforge/chinese
@@ -106,9 +106,9 @@ sudo easytier-core -d --network-name abc --network-secret abc -p tcp://public.ea
 ```text
 | ipv4         | hostname       | cost  | lat_ms | loss_rate | rx_bytes | tx_bytes | tunnel_proto | nat_type | id         | version         |
 | ------------ | -------------- | ----- | ------ | --------- | -------- | -------- | ------------ | -------- | ---------- | --------------- |
-| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.0-70e69a38~ |
-| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.0-70e69a38~ |
-|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.0-70e69a38~ |
+| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.5-70e69a38~ |
+| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.5-70e69a38~ |
+|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.5-70e69a38~ |
 ```
 
 您可以测试节点之间的连通性：
@@ -281,13 +281,14 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 - [ZeroTier](https://www.zerotier.com/)：用于连接设备的全球虚拟网络。
 - [TailScale](https://tailscale.com/)：旨在简化网络配置的 VPN 解决方案。
-- [vpncloud](https://github.com/dswd/vpncloud)：一个 P2P 网状 VPN
-- [Candy](https://github.com/lanthora/candy)：一个可靠、低延迟、反审查的虚拟专用网络
 
 ### 联系我们
 
 - 💬 **[Telegram 群组](https://t.me/easytier)**
-- 👥 **[QQ 群：949700262](https://qm.qq.com/cgi-bin/qm/qr?k=kC8YJ6Jb8vWJIDbZrZJB8pB5YZgPJA5-)**
+- 👥 **QQ 群**
+  - 一群 [949700262](https://qm.qq.com/q/wFoTUChqZW)
+  - 二群 [837676408](https://qm.qq.com/q/4V33DrfgHe)
+  - 三群 [957189589](https://qm.qq.com/q/YNyTQjwlai)
 
 ## 许可证
 
@@ -303,11 +304,14 @@ EasyTier 在 [LGPL-3.0](https://github.com/EasyTier/EasyTier/blob/main/LICENSE) 
 </a>
 </p>
 
-特别感谢 [浪浪云](https://langlang.cloud/) 赞助我们的公共服务器。
+特别感谢 [浪浪云](https://langlangy.cn/?i26c5a5) 和 [雨云](https://www.rainyun.com/NjM0NzQ1_) 赞助我们的公共服务器。
 
 <p align="center">
 <a href="https://langlangy.cn/?i26c5a5" target="_blank">
 <img src="assets/langlang.png" width="200">
+</a>
+<a href="https://langlangy.cn/?i26c5a5" target="_blank">
+<img src="assets/raincloud.png" width="200">
 </a>
 </p>
 

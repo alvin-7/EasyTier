@@ -2,9 +2,8 @@ use std::sync::Mutex;
 
 use dashmap::DashMap;
 use easytier::{
-    common::config::{ConfigLoader as _, TomlConfigLoader},
+    common::config::{ConfigFileControl, ConfigLoader as _, TomlConfigLoader},
     instance_manager::NetworkInstanceManager,
-    launcher::ConfigSource,
 };
 
 // iOS 特定绑定
@@ -33,8 +32,10 @@ fn set_error_msg(msg: &str) {
     msg_buf[..len].copy_from_slice(bytes);
 }
 
+/// # Safety
+/// Set the tun fd
 #[no_mangle]
-pub extern "C" fn set_tun_fd(
+pub unsafe extern "C" fn set_tun_fd(
     inst_name: *const std::ffi::c_char,
     fd: std::ffi::c_int,
 ) -> std::ffi::c_int {
@@ -47,18 +48,23 @@ pub extern "C" fn set_tun_fd(
     if !INSTANCE_NAME_ID_MAP.contains_key(&inst_name) {
         return -1;
     }
-    match INSTANCE_MANAGER.set_tun_fd(&INSTANCE_NAME_ID_MAP.get(&inst_name).unwrap().value(), fd) {
-        Ok(_) => {
-            0
-        }
-        Err(_) => {
-            -1
-        }
+
+    let inst_id = *INSTANCE_NAME_ID_MAP
+        .get(&inst_name)
+        .as_ref()
+        .unwrap()
+        .value();
+
+    match INSTANCE_MANAGER.set_tun_fd(&inst_id, fd) {
+        Ok(_) => 0,
+        Err(_) => -1,
     }
 }
 
+/// # Safety
+/// Get the last error message
 #[no_mangle]
-pub extern "C" fn get_error_msg(out: *mut *const std::ffi::c_char) {
+pub unsafe extern "C" fn get_error_msg(out: *mut *const std::ffi::c_char) {
     let msg_buf = ERROR_MSG.lock().unwrap();
     if msg_buf.is_empty() {
         unsafe {
@@ -82,8 +88,10 @@ pub extern "C" fn free_string(s: *const std::ffi::c_char) {
     }
 }
 
+/// # Safety
+/// Parse the config
 #[no_mangle]
-pub extern "C" fn parse_config(cfg_str: *const std::ffi::c_char) -> std::ffi::c_int {
+pub unsafe extern "C" fn parse_config(cfg_str: *const std::ffi::c_char) -> std::ffi::c_int {
     let cfg_str = unsafe {
         assert!(!cfg_str.is_null());
         std::ffi::CStr::from_ptr(cfg_str)
@@ -99,8 +107,10 @@ pub extern "C" fn parse_config(cfg_str: *const std::ffi::c_char) -> std::ffi::c_
     0
 }
 
+/// # Safety
+/// Run the network instance
 #[no_mangle]
-pub extern "C" fn run_network_instance(cfg_str: *const std::ffi::c_char) -> std::ffi::c_int {
+pub unsafe extern "C" fn run_network_instance(cfg_str: *const std::ffi::c_char) -> std::ffi::c_int {
     let cfg_str = unsafe {
         assert!(!cfg_str.is_null());
         std::ffi::CStr::from_ptr(cfg_str)
@@ -122,21 +132,24 @@ pub extern "C" fn run_network_instance(cfg_str: *const std::ffi::c_char) -> std:
         return -1;
     }
 
-    let instance_id = match INSTANCE_MANAGER.run_network_instance(cfg, ConfigSource::FFI) {
-        Ok(id) => id,
-        Err(e) => {
-            set_error_msg(&format!("failed to start instance: {}", e));
-            return -1;
-        }
-    };
+    let instance_id =
+        match INSTANCE_MANAGER.run_network_instance(cfg, false, ConfigFileControl::STATIC_CONFIG) {
+            Ok(id) => id,
+            Err(e) => {
+                set_error_msg(&format!("failed to start instance: {}", e));
+                return -1;
+            }
+        };
 
     INSTANCE_NAME_ID_MAP.insert(inst_name, instance_id);
 
     0
 }
 
+/// # Safety
+/// Retain the network instance
 #[no_mangle]
-pub extern "C" fn retain_network_instance(
+pub unsafe extern "C" fn retain_network_instance(
     inst_names: *const *const std::ffi::c_char,
     length: usize,
 ) -> std::ffi::c_int {
@@ -172,13 +185,15 @@ pub extern "C" fn retain_network_instance(
         return -1;
     }
 
-    let _ = INSTANCE_NAME_ID_MAP.retain(|k, _| inst_names.contains(k));
+    INSTANCE_NAME_ID_MAP.retain(|k, _| inst_names.contains(k));
 
     0
 }
 
+/// # Safety
+/// Collect the network infos
 #[no_mangle]
-pub extern "C" fn collect_network_infos(
+pub unsafe extern "C" fn collect_network_infos(
     infos: *mut KeyValuePair,
     max_length: usize,
 ) -> std::ffi::c_int {
@@ -191,7 +206,7 @@ pub extern "C" fn collect_network_infos(
         std::slice::from_raw_parts_mut(infos, max_length)
     };
 
-    let collected_infos = match INSTANCE_MANAGER.collect_network_infos() {
+    let collected_infos = match INSTANCE_MANAGER.collect_network_infos_sync() {
         Ok(infos) => infos,
         Err(e) => {
             set_error_msg(&format!("failed to collect network infos: {}", e));
@@ -237,7 +252,9 @@ mod tests {
             network = "test_network"
         "#;
         let cstr = std::ffi::CString::new(cfg_str).unwrap();
-        assert_eq!(parse_config(cstr.as_ptr()), 0);
+        unsafe {
+            assert_eq!(parse_config(cstr.as_ptr()), 0);
+        }
     }
 
     #[test]
@@ -247,6 +264,8 @@ mod tests {
             network = "test_network"
         "#;
         let cstr = std::ffi::CString::new(cfg_str).unwrap();
-        assert_eq!(run_network_instance(cstr.as_ptr()), 0);
+        unsafe {
+            assert_eq!(run_network_instance(cstr.as_ptr()), 0);
+        }
     }
 }

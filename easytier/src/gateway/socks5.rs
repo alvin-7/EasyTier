@@ -1,11 +1,15 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
+    },
     time::{Duration, Instant},
 };
 
 use crossbeam::atomic::AtomicCell;
 use kcp_sys::{endpoint::KcpEndpoint, stream::KcpStream};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     common::{
@@ -37,7 +41,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpSocket, UdpSocket},
     select,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Mutex, Notify},
     task::JoinSet,
     time::timeout,
 };
@@ -71,9 +75,9 @@ impl SocksUdpSocket {
 }
 
 enum SocksTcpStream {
-    TcpStream(tokio::net::TcpStream),
-    SmolTcpStream(super::tokio_smoltcp::TcpStream),
-    KcpStream(KcpStream),
+    Tcp(tokio::net::TcpStream),
+    SmolTcp(super::tokio_smoltcp::TcpStream),
+    Kcp(KcpStream),
 }
 
 impl AsyncRead for SocksTcpStream {
@@ -83,15 +87,11 @@ impl AsyncRead for SocksTcpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            SocksTcpStream::TcpStream(ref mut stream) => {
+            SocksTcpStream::Tcp(ref mut stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            SocksTcpStream::SmolTcp(ref mut stream) => {
                 std::pin::Pin::new(stream).poll_read(cx, buf)
             }
-            SocksTcpStream::SmolTcpStream(ref mut stream) => {
-                std::pin::Pin::new(stream).poll_read(cx, buf)
-            }
-            SocksTcpStream::KcpStream(ref mut stream) => {
-                std::pin::Pin::new(stream).poll_read(cx, buf)
-            }
+            SocksTcpStream::Kcp(ref mut stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -103,15 +103,11 @@ impl AsyncWrite for SocksTcpStream {
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         match self.get_mut() {
-            SocksTcpStream::TcpStream(ref mut stream) => {
+            SocksTcpStream::Tcp(ref mut stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            SocksTcpStream::SmolTcp(ref mut stream) => {
                 std::pin::Pin::new(stream).poll_write(cx, buf)
             }
-            SocksTcpStream::SmolTcpStream(ref mut stream) => {
-                std::pin::Pin::new(stream).poll_write(cx, buf)
-            }
-            SocksTcpStream::KcpStream(ref mut stream) => {
-                std::pin::Pin::new(stream).poll_write(cx, buf)
-            }
+            SocksTcpStream::Kcp(ref mut stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -120,11 +116,9 @@ impl AsyncWrite for SocksTcpStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
-            SocksTcpStream::TcpStream(ref mut stream) => std::pin::Pin::new(stream).poll_flush(cx),
-            SocksTcpStream::SmolTcpStream(ref mut stream) => {
-                std::pin::Pin::new(stream).poll_flush(cx)
-            }
-            SocksTcpStream::KcpStream(ref mut stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            SocksTcpStream::Tcp(ref mut stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            SocksTcpStream::SmolTcp(ref mut stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            SocksTcpStream::Kcp(ref mut stream) => std::pin::Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -133,15 +127,9 @@ impl AsyncWrite for SocksTcpStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
-            SocksTcpStream::TcpStream(ref mut stream) => {
-                std::pin::Pin::new(stream).poll_shutdown(cx)
-            }
-            SocksTcpStream::SmolTcpStream(ref mut stream) => {
-                std::pin::Pin::new(stream).poll_shutdown(cx)
-            }
-            SocksTcpStream::KcpStream(ref mut stream) => {
-                std::pin::Pin::new(stream).poll_shutdown(cx)
-            }
+            SocksTcpStream::Tcp(ref mut stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            SocksTcpStream::SmolTcp(ref mut stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            SocksTcpStream::Kcp(ref mut stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -195,7 +183,7 @@ impl AsyncTcpConnector for SmolTcpConnector {
             let modified_addr =
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port());
 
-            Ok(SocksTcpStream::TcpStream(
+            Ok(SocksTcpStream::Tcp(
                 tcp_connect_with_timeout(modified_addr, timeout_s).await?,
             ))
         } else {
@@ -206,9 +194,9 @@ impl AsyncTcpConnector for SmolTcpConnector {
             .await
             .with_context(|| "connect to remote timeout")?;
 
-            Ok(SocksTcpStream::SmolTcpStream(remote_socket.map_err(
-                |e| super::fast_socks5::SocksError::Other(e.into()),
-            )?))
+            Ok(SocksTcpStream::SmolTcp(remote_socket.map_err(|e| {
+                super::fast_socks5::SocksError::Other(e.into())
+            })?))
         }
     }
 }
@@ -248,7 +236,7 @@ impl AsyncTcpConnector for Socks5KcpConnector {
             .connect(self.src_addr, addr)
             .await
             .map_err(|e| super::fast_socks5::SocksError::Other(e.into()))?;
-        Ok(SocksTcpStream::KcpStream(ret))
+        Ok(SocksTcpStream::Kcp(ret))
     }
 }
 
@@ -317,8 +305,7 @@ impl Socks5ServerNet {
                     tracing::error!("send to smoltcp stack failed: {:?}", e);
                 }
             }
-            tracing::error!("smoltcp stack sink exited");
-            panic!("smoltcp stack sink exited");
+            tracing::warn!("smoltcp stack sink exited");
         });
 
         forward_tasks.spawn(async move {
@@ -335,12 +322,14 @@ impl Socks5ServerNet {
 
                 let dst = ipv4.get_destination();
                 let packet = ZCPacket::new_with_payload(&data);
-                if let Err(e) = peer_manager.send_msg_by_ip(packet, IpAddr::V4(dst)).await {
+                if let Err(e) = peer_manager
+                    .send_msg_by_ip(packet, IpAddr::V4(dst), false)
+                    .await
+                {
                     tracing::error!("send to peer failed in smoltcp sender: {:?}", e);
                 }
             }
-            tracing::error!("smoltcp stack stream exited");
-            panic!("smoltcp stack stream exited");
+            tracing::warn!("smoltcp stack stream exited");
         });
 
         let interface_config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
@@ -432,11 +421,22 @@ pub struct Socks5Server {
     udp_forward_task: Arc<DashMap<UdpClientKey, ScopedTask<()>>>,
 
     kcp_endpoint: Mutex<Option<Weak<KcpEndpoint>>>,
+
+    socks5_enabled: Arc<AtomicBool>,
+    cancel_tokens: Arc<DashMap<PortForwardConfig, DropGuard>>,
+    port_forward_list_change_notifier: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
 impl PeerPacketFilter for Socks5Server {
     async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
+        if self.cancel_tokens.is_empty()
+            && self.entries.is_empty()
+            && !self.socks5_enabled.load(Ordering::Relaxed)
+        {
+            return Some(packet);
+        }
+
         let hdr = packet.peer_manager_header().unwrap();
         if hdr.packet_type != PacketType::Data as u8 {
             return Some(packet);
@@ -451,7 +451,9 @@ impl PeerPacketFilter for Socks5Server {
 
         let entry_key = match ipv4.get_next_level_protocol() {
             IpNextHeaderProtocols::Tcp => {
-                let tcp_packet = TcpPacket::new(ipv4.payload()).unwrap();
+                let Some(tcp_packet) = TcpPacket::new(ipv4.payload()) else {
+                    return Some(packet);
+                };
                 Socks5Entry {
                     dst: SocketAddr::new(ipv4.get_source().into(), tcp_packet.get_source()),
                     src: SocketAddr::new(
@@ -480,7 +482,9 @@ impl PeerPacketFilter for Socks5Server {
                     return Some(packet);
                 }
 
-                let udp_packet = UdpPacket::new(ipv4.payload()).unwrap();
+                let Some(udp_packet) = UdpPacket::new(ipv4.payload()) else {
+                    return Some(packet);
+                };
                 Socks5Entry {
                     dst: SocketAddr::new(ipv4.get_source().into(), udp_packet.get_source()),
                     src: SocketAddr::new(
@@ -531,6 +535,10 @@ impl Socks5Server {
             udp_forward_task: Arc::new(DashMap::new()),
 
             kcp_endpoint: Mutex::new(None),
+
+            socks5_enabled: Arc::new(AtomicBool::new(false)),
+            cancel_tokens: Arc::new(DashMap::new()),
+            port_forward_list_change_notifier: Arc::new(Notify::new()),
         })
     }
 
@@ -542,9 +550,18 @@ impl Socks5Server {
         let entries = self.entries.clone();
         let tcp_forward_task = self.tcp_forward_task.clone();
         let udp_client_map = self.udp_client_map.clone();
+        let cancel_tokens = self.cancel_tokens.clone();
+        let port_forward_list_change_notifier = self.port_forward_list_change_notifier.clone();
+        let socks5_enabled = self.socks5_enabled.clone();
         self.tasks.lock().unwrap().spawn(async move {
             let mut prev_ipv4 = None;
             loop {
+                if cancel_tokens.is_empty() && !socks5_enabled.load(Ordering::Relaxed) {
+                    let _ = net.lock().await.take();
+                    port_forward_list_change_notifier.notified().await;
+                    continue;
+                }
+
                 let mut event_recv = global_ctx.subscribe();
 
                 let cur_ipv4 = global_ctx.get_ipv4();
@@ -555,16 +572,16 @@ impl Socks5Server {
                     tcp_forward_task.lock().unwrap().abort_all();
                     udp_client_map.clear();
 
-                    if cur_ipv4.is_none() {
-                        let _ = net.lock().await.take();
-                    } else {
+                    if let Some(cur_ipv4) = cur_ipv4 {
                         net.lock().await.replace(Socks5ServerNet::new(
-                            cur_ipv4.unwrap(),
+                            cur_ipv4,
                             None,
                             peer_manager.clone(),
                             packet_recv.clone(),
                             entries.clone(),
                         ));
+                    } else {
+                        let _ = net.lock().await.take();
                     }
                 }
 
@@ -581,7 +598,6 @@ impl Socks5Server {
         kcp_endpoint: Option<Weak<KcpEndpoint>>,
     ) -> Result<(), Error> {
         *self.kcp_endpoint.lock().await = kcp_endpoint;
-        let mut need_start = false;
         if let Some(proxy_url) = self.global_ctx.config.get_socks5_portal() {
             let bind_addr = format!(
                 "{}:{}",
@@ -609,24 +625,40 @@ impl Socks5Server {
                 }
             });
 
+            self.socks5_enabled.store(true, Ordering::Relaxed);
             join_joinset_background(self.tasks.clone(), "socks5 server".to_string());
-
-            need_start = true;
         };
 
-        for port_forward in self.global_ctx.config.get_port_forwards() {
-            self.add_port_forward(port_forward).await?;
-            need_start = true;
+        let cfgs = self.global_ctx.config.get_port_forwards();
+        self.reload_port_forwards(&cfgs).await?;
+
+        self.peer_manager
+            .add_packet_process_pipeline(Box::new(self.clone()))
+            .await;
+
+        self.run_net_update_task().await;
+
+        Ok(())
+    }
+
+    pub async fn reload_port_forwards(&self, cfgs: &Vec<PortForwardConfig>) -> Result<(), Error> {
+        // remove entries not in new cfg
+        self.cancel_tokens.retain(|k, _| {
+            cfgs.iter().any(|cfg| {
+                if cfg.dst_addr.ip().is_unspecified() {
+                    k.bind_addr == cfg.bind_addr && k.proto == cfg.proto
+                } else {
+                    k == cfg
+                }
+            })
+        });
+        // add new ones
+        for cfg in cfgs {
+            if !self.cancel_tokens.contains_key(cfg) {
+                self.add_port_forward(cfg.clone()).await?;
+            }
         }
-
-        if need_start {
-            self.peer_manager
-                .add_packet_process_pipeline(Box::new(self.clone()))
-                .await;
-
-            self.run_net_update_task().await;
-        }
-
+        self.port_forward_list_change_notifier.notify_one();
         Ok(())
     }
 
@@ -660,12 +692,10 @@ impl Socks5Server {
     pub async fn add_port_forward(&self, cfg: PortForwardConfig) -> Result<(), Error> {
         match cfg.proto.to_lowercase().as_str() {
             "tcp" => {
-                self.add_tcp_port_forward(cfg.bind_addr, cfg.dst_addr)
-                    .await?;
+                self.add_tcp_port_forward(&cfg).await?;
             }
             "udp" => {
-                self.add_udp_port_forward(cfg.bind_addr, cfg.dst_addr)
-                    .await?;
+                self.add_udp_port_forward(&cfg).await?;
             }
             _ => {
                 return Err(anyhow::anyhow!(
@@ -680,11 +710,12 @@ impl Socks5Server {
         Ok(())
     }
 
-    pub async fn add_tcp_port_forward(
-        &self,
-        bind_addr: SocketAddr,
-        dst_addr: SocketAddr,
-    ) -> Result<(), Error> {
+    pub fn remove_port_forward(&self, cfg: PortForwardConfig) {
+        let _ = self.cancel_tokens.remove(&cfg);
+    }
+
+    pub async fn add_tcp_port_forward(&self, cfg: &PortForwardConfig) -> Result<(), Error> {
+        let (bind_addr, dst_addr) = (cfg.bind_addr, cfg.dst_addr);
         let listener = bind_tcp_socket(bind_addr, self.global_ctx.net_ns.clone())?;
 
         let net = self.net.clone();
@@ -693,14 +724,26 @@ impl Socks5Server {
         let forward_tasks = tasks.clone();
         let kcp_endpoint = self.kcp_endpoint.lock().await.clone();
         let peer_mgr = Arc::downgrade(&self.peer_manager.clone());
+        let cancel_token = CancellationToken::new();
+        self.cancel_tokens
+            .insert(cfg.clone(), cancel_token.clone().drop_guard());
 
         self.tasks.lock().unwrap().spawn(async move {
             loop {
-                let (incoming_socket, addr) = match listener.accept().await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        tracing::error!("port forward accept error = {:?}", err);
-                        continue;
+                let (incoming_socket, addr) = select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        tracing::info!("port forward for {:?} cancelled", bind_addr);
+                        break;
+                    }
+                    res = listener.accept() => {
+                        match res {
+                            Ok(result) => result,
+                            Err(err) => {
+                                tracing::error!("port forward accept error = {:?}", err);
+                                continue;
+                            }
+                        }
                     }
                 };
 
@@ -716,20 +759,26 @@ impl Socks5Server {
                     continue;
                 };
 
+                let Some(peer_mgr_arc) = peer_mgr.upgrade() else {
+                    tracing::error!("peer manager is dropped");
+                    continue;
+                };
+
+                let dst_allow_kcp = peer_mgr_arc.check_allow_kcp_to_dst(&dst_addr.ip()).await;
+                tracing::debug!("dst_allow_kcp: {:?}", dst_allow_kcp);
+
                 let connector: Box<dyn AsyncTcpConnector<S = SocksTcpStream> + Send> =
-                    if kcp_endpoint.is_none() {
-                        Box::new(SmolTcpConnector {
+                    match (&kcp_endpoint, dst_allow_kcp) {
+                        (Some(kcp_endpoint), true) => Box::new(Socks5KcpConnector {
+                            kcp_endpoint: kcp_endpoint.clone(),
+                            peer_mgr: peer_mgr.clone(),
+                            src_addr: addr,
+                        }),
+                        (_, _) => Box::new(SmolTcpConnector {
                             net: net.smoltcp_net.clone(),
                             entries: entries.clone(),
                             current_entry: std::sync::Mutex::new(None),
-                        })
-                    } else {
-                        let kcp_endpoint = kcp_endpoint.as_ref().unwrap().clone();
-                        Box::new(Socks5KcpConnector {
-                            kcp_endpoint,
-                            peer_mgr: peer_mgr.clone(),
-                            src_addr: addr,
-                        })
+                        }),
                     };
 
                 forward_tasks
@@ -747,11 +796,8 @@ impl Socks5Server {
     }
 
     #[tracing::instrument(name = "add_udp_port_forward", skip(self))]
-    pub async fn add_udp_port_forward(
-        &self,
-        bind_addr: SocketAddr,
-        dst_addr: SocketAddr,
-    ) -> Result<(), Error> {
+    pub async fn add_udp_port_forward(&self, cfg: &PortForwardConfig) -> Result<(), Error> {
+        let (bind_addr, dst_addr) = (cfg.bind_addr, cfg.dst_addr);
         let socket = Arc::new(bind_udp_socket(bind_addr, self.global_ctx.net_ns.clone())?);
 
         let entries = self.entries.clone();
@@ -759,16 +805,28 @@ impl Socks5Server {
         let net = self.net.clone();
         let udp_client_map = self.udp_client_map.clone();
         let udp_forward_task = self.udp_forward_task.clone();
+        let cancel_token = CancellationToken::new();
+        self.cancel_tokens
+            .insert(cfg.clone(), cancel_token.clone().drop_guard());
 
         self.tasks.lock().unwrap().spawn(async move {
             loop {
                 // we set the max buffer size of smoltcp to 8192, so we need to use a buffer size that is less than 8192 here.
                 let mut buf = vec![0u8; 8192];
-                let (len, addr) = match socket.recv_from(&mut buf).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        tracing::error!("udp port forward recv error = {:?}", err);
-                        continue;
+                let (len, addr) = select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        tracing::info!("udp port forward for {:?} cancelled", bind_addr);
+                        break;
+                    }
+                    res = socket.recv_from(&mut buf) => {
+                        match res {
+                            Ok(result) => result,
+                            Err(err) => {
+                                tracing::error!("udp port forward recv error = {:?}", err);
+                                continue;
+                            }
+                        }
                     }
                 };
 
@@ -903,6 +961,7 @@ impl Socks5Server {
         let udp_client_map = self.udp_client_map.clone();
         let udp_forward_task = self.udp_forward_task.clone();
         let entries = self.entries.clone();
+        let cancel_tokens = self.cancel_tokens.clone();
         self.tasks.lock().unwrap().spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -910,13 +969,18 @@ impl Socks5Server {
                 udp_client_map.retain(|_, client_info| {
                     now.duration_since(client_info.last_active.load()).as_secs() < 600
                 });
-                udp_forward_task.retain(|k, _| udp_client_map.contains_key(&k));
+                udp_forward_task.retain(|k, _| udp_client_map.contains_key(k));
                 entries.retain(|_, data| match data {
                     Socks5EntryData::Udp((_, udp_client_key)) => {
-                        udp_client_map.contains_key(&udp_client_key)
+                        udp_client_map.contains_key(udp_client_key)
                     }
                     _ => true,
                 });
+
+                udp_client_map.shrink_to_fit();
+                udp_forward_task.shrink_to_fit();
+                entries.shrink_to_fit();
+                cancel_tokens.shrink_to_fit();
             }
         });
 
