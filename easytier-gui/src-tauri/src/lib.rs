@@ -12,17 +12,20 @@ use easytier::rpc_service::remote_client::{
     GetNetworkMetasResponse, ListNetworkInstanceIdsJsonResp, ListNetworkProps, RemoteClientManager,
     Storage,
 };
+use easytier::web_client::{self, WebClient};
 use easytier::{
     common::config::{ConfigLoader, FileLoggerConfig, LoggingConfigBuilder, TomlConfigLoader},
     instance_manager::NetworkInstanceManager,
     launcher::NetworkConfig,
     rpc_service::ApiRpcServer,
     tunnel::ring::RingTunnelListener,
+    tunnel::tcp::TcpTunnelListener,
+    tunnel::TunnelListener,
     utils::{self},
 };
 use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use uuid::Uuid;
 
 use tauri::{AppHandle, Emitter, Manager as _};
@@ -39,7 +42,23 @@ static RPC_RING_UUID: once_cell::sync::Lazy<uuid::Uuid> =
 static CLIENT_MANAGER: once_cell::sync::Lazy<RwLock<Option<manager::GUIClientManager>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(None));
 
-static RING_RPC_SERVER: once_cell::sync::Lazy<RwLock<Option<ApiRpcServer<RingTunnelListener>>>> =
+type BoxedTunnelListener = Box<dyn TunnelListener>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RpcServerKind {
+    Ring,
+    Tcp,
+}
+
+struct RpcServer {
+    kind: RpcServerKind,
+    _server: ApiRpcServer<BoxedTunnelListener>,
+    bind_url: Option<url::Url>,
+}
+static RPC_SERVER: once_cell::sync::Lazy<Mutex<Option<RpcServer>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+static WEB_CLIENT: once_cell::sync::Lazy<RwLock<Option<WebClient>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(None));
 
 macro_rules! get_client_manager {
@@ -93,28 +112,18 @@ async fn run_network_instance(
     cfg: NetworkConfig,
     save: bool,
 ) -> Result<(), String> {
-    let instance_id = cfg.instance_id().to_string();
-
-    app.emit("pre_run_network_instance", cfg.instance_id())
-        .map_err(|e| e.to_string())?;
-
     let client_manager = get_client_manager!()?;
-
-    #[cfg(target_os = "android")]
-    if cfg.no_tun() == false {
-        client_manager
-            .disable_instances_with_tun(&app)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
+    let toml_config = cfg.gen_config().map_err(|e| e.to_string())?;
+    client_manager
+        .pre_run_network_instance_hook(&app, &toml_config)
+        .await?;
     client_manager
         .handle_run_network_instance(app.clone(), cfg, save)
         .await
         .map_err(|e| e.to_string())?;
-
-    app.emit("post_run_network_instance", instance_id)
-        .map_err(|e| e.to_string())?;
+    client_manager
+        .post_run_network_instance_hook(&app, &toml_config.get_id())
+        .await?;
     Ok(())
 }
 
@@ -178,7 +187,10 @@ async fn remove_network_instance(app: AppHandle, instance_id: String) -> Result<
         .handle_remove_network_instances(app.clone(), vec![instance_id])
         .await
         .map_err(|e| e.to_string())?;
-    client_manager.notify_vpn_stop_if_no_tun(&app)?;
+    client_manager
+        .post_remove_network_instances_hook(&app, &[instance_id])
+        .await?;
+
     Ok(())
 }
 
@@ -196,9 +208,13 @@ async fn update_network_config_state(
         .handle_update_network_state(app.clone(), instance_id, disabled)
         .await
         .map_err(|e| e.to_string())?;
+
     if disabled {
-        client_manager.notify_vpn_stop_if_no_tun(&app)?;
+        client_manager
+            .post_remove_network_instances_hook(&app, &[instance_id])
+            .await?;
     }
+
     Ok(())
 }
 
@@ -227,13 +243,14 @@ async fn validate_config(
 
 #[tauri::command]
 async fn get_config(app: AppHandle, instance_id: String) -> Result<NetworkConfig, String> {
+    let instance_id = instance_id
+        .parse()
+        .map_err(|e: uuid::Error| e.to_string())?;
     let cfg = get_client_manager!()?
-        .storage
-        .get_network_config(app, &instance_id)
+        .handle_get_network_config(app, instance_id)
         .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Config not found for instance ID: {}", instance_id))?;
-    Ok(cfg.1)
+        .map_err(|e| e.to_string())?;
+    Ok(cfg)
 }
 
 #[tauri::command]
@@ -320,8 +337,25 @@ fn get_service_status() -> Result<&'static str, String> {
     }
 }
 
+fn normalize_normal_mode_rpc_portal(portal: &str) -> Result<(url::Url, url::Url), String> {
+    let portal_url: url::Url = portal
+        .parse()
+        .map_err(|e| format!("invalid rpc portal: {:#}", e))?;
+    let bind_url = portal_url.clone();
+    let mut connect_url = portal_url.clone();
+    // if bind addr is 0.0.0.0, should convert to 127.0.0.1
+    if connect_url.host_str() == Some("0.0.0.0") {
+        connect_url.set_host(Some("127.0.0.1")).unwrap();
+    }
+    Ok((bind_url, connect_url))
+}
+
 #[tauri::command]
-async fn init_rpc_connection(_app: AppHandle, url: Option<String>) -> Result<(), String> {
+async fn init_rpc_connection(
+    _app: AppHandle,
+    is_normal_mode: bool,
+    url: Option<String>,
+) -> Result<(), String> {
     let mut client_manager_guard =
         tokio::time::timeout(std::time::Duration::from_secs(5), CLIENT_MANAGER.write())
             .await
@@ -329,52 +363,81 @@ async fn init_rpc_connection(_app: AppHandle, url: Option<String>) -> Result<(),
     let mut instance_manager_guard = INSTANCE_MANAGER
         .try_write()
         .map_err(|_| "Failed to acquire write lock for instance manager")?;
-    let mut ring_rpc_server_guard = RING_RPC_SERVER
-        .try_write()
-        .map_err(|_| "Failed to acquire write lock for ring rpc server")?;
+    let mut rpc_server_guard = RPC_SERVER
+        .try_lock()
+        .map_err(|_| "Failed to acquire lock for rpc server")?;
 
-    let normal_mode = url.is_none();
-    if normal_mode {
+    let mut client_url = url.clone();
+    if is_normal_mode {
         let instance_manager = if let Some(im) = instance_manager_guard.take() {
             im
         } else {
             Arc::new(NetworkInstanceManager::new())
         };
-        let rpc_server = if let Some(rpc_server) = ring_rpc_server_guard.take() {
-            rpc_server
+
+        let portal = url.and_then(|s| {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+
+        let (desired_kind, bind_url, connect_url) = if let Some(portal) = portal {
+            let (bind_url, connect_url) = normalize_normal_mode_rpc_portal(&portal)?;
+            (RpcServerKind::Tcp, Some(bind_url), Some(connect_url))
         } else {
-            ApiRpcServer::from_tunnel(
-                RingTunnelListener::new(
-                    format!("ring://{}", RPC_RING_UUID.deref()).parse().unwrap(),
-                ),
-                instance_manager.clone(),
-            )
-            .with_rx_timeout(None)
-            .serve()
-            .await
-            .map_err(|e| e.to_string())?
+            (RpcServerKind::Ring, None, None)
         };
 
+        let need_restart = rpc_server_guard
+            .as_ref()
+            .map(|x| x.kind != desired_kind || x.bind_url != bind_url)
+            .unwrap_or(true);
+
+        if need_restart {
+            *rpc_server_guard = None;
+
+            let tunnel: BoxedTunnelListener = match desired_kind {
+                RpcServerKind::Ring => Box::new(RingTunnelListener::new(
+                    format!("ring://{}", RPC_RING_UUID.deref()).parse().unwrap(),
+                )),
+                RpcServerKind::Tcp => Box::new(TcpTunnelListener::new(
+                    bind_url.clone().expect("tcp rpc must have bind url"),
+                )),
+            };
+
+            let rpc_server = ApiRpcServer::from_tunnel(tunnel, instance_manager.clone())
+                .with_rx_timeout(None)
+                .serve()
+                .await
+                .map_err(|e| e.to_string())?;
+            *rpc_server_guard = Some(RpcServer {
+                kind: desired_kind,
+                _server: rpc_server,
+                bind_url,
+            });
+        }
+
         *instance_manager_guard = Some(instance_manager);
-        *ring_rpc_server_guard = Some(rpc_server);
+        client_url = connect_url.map(|u| u.to_string());
     } else {
-        *ring_rpc_server_guard = None;
+        *rpc_server_guard = None;
     }
 
-    let mut client_manager = tokio::time::timeout(
+    let client_manager = tokio::time::timeout(
         std::time::Duration::from_millis(1000),
-        manager::GUIClientManager::new(url),
+        manager::GUIClientManager::new(client_url),
     )
     .await
     .map_err(|_| "connect remote rpc timed out".to_string())?
     .with_context(|| "Failed to connect remote rpc")
     .map_err(|e| format!("{:#}", e))?;
-    if let Some(old_manager) = client_manager_guard.take() {
-        client_manager.storage = old_manager.storage;
-    }
     *client_manager_guard = Some(client_manager);
 
-    if !normal_mode {
+    if !is_normal_mode {
+        drop(WEB_CLIENT.write().await.take());
         if let Some(instance_manager) = instance_manager_guard.take() {
             instance_manager
                 .retain_network_instance(vec![])
@@ -391,19 +454,84 @@ async fn is_client_running() -> Result<bool, String> {
     Ok(get_client_manager!()?.rpc_manager.is_running())
 }
 
+#[tauri::command]
+async fn init_web_client(app: AppHandle, url: Option<String>) -> Result<(), String> {
+    let mut web_client_guard = WEB_CLIENT.write().await;
+    let Some(url) = url else {
+        *web_client_guard = None;
+        return Ok(());
+    };
+    let instance_manager = INSTANCE_MANAGER
+        .try_read()
+        .map_err(|_| "Failed to acquire read lock for instance manager")?
+        .clone()
+        .ok_or_else(|| "Instance manager is not available".to_string())?;
+
+    let hooks = Arc::new(manager::GuiHooks { app: app.clone() });
+
+    let web_client =
+        web_client::run_web_client(url.as_str(), None, None, instance_manager, Some(hooks))
+            .await
+            .with_context(|| "Failed to initialize web client")
+            .map_err(|e| format!("{:#}", e))?;
+    *web_client_guard = Some(web_client);
+    Ok(())
+}
+
+#[tauri::command]
+async fn is_web_client_connected() -> Result<bool, String> {
+    let web_client_guard = WEB_CLIENT.read().await;
+    if let Some(web_client) = web_client_guard.as_ref() {
+        Ok(web_client.is_connected())
+    } else {
+        Ok(false)
+    }
+}
+
+// 获取日志目录的辅助函数
+fn get_log_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, tauri::Error> {
+    if cfg!(target_os = "android") {
+        // Android: cache_dir + logs 子目录
+        app.path().cache_dir().map(|p| p.join("logs"))
+    } else {
+        // 其他平台: 默认日志目录
+        app.path().app_log_dir()
+    }
+}
+
+#[tauri::command]
+async fn get_log_dir_path(app: tauri::AppHandle) -> Result<String, String> {
+    match get_log_dir(&app) {
+        Ok(log_dir) => {
+            std::fs::create_dir_all(&log_dir).ok();
+            Ok(log_dir.to_string_lossy().to_string())
+        }
+        Err(e) => Err(format!("Failed to get log directory: {}", e)),
+    }
+}
+
 #[cfg(not(target_os = "android"))]
-fn toggle_window_visibility<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+fn toggle_window_visibility(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or_default() {
-            if window.is_minimized().unwrap_or_default() {
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            } else {
-                let _ = window.hide();
+        let visible = window.is_visible().unwrap_or_default();
+        let minimized = window.is_minimized().unwrap_or_default();
+        let focused = window.is_focused().unwrap_or_default();
+
+        let should_show = !visible || minimized || !focused;
+        if should_show {
+            if !visible {
+                let _ = window.show();
             }
+            if minimized {
+                let _ = window.unminimize();
+            }
+            if !focused {
+                let _ = window.set_focus();
+            }
+            let _ = set_dock_visibility(app.clone(), true);
         } else {
-            let _ = window.show();
-            let _ = window.set_focus();
+            let _ = window.hide();
+            let _ = set_dock_visibility(app.clone(), false);
         }
     }
 }
@@ -440,7 +568,7 @@ mod manager {
     use easytier::common::stun::MockStunInfoCollector;
     use easytier::launcher::NetworkConfig;
     use easytier::proto::api::logger::{LoggerRpc, LoggerRpcClientFactory, SetLoggerConfigRequest};
-    use easytier::proto::api::manage::{ListNetworkInstanceRequest, RunNetworkInstanceRequest};
+    use easytier::proto::api::manage::RunNetworkInstanceRequest;
     use easytier::proto::common::NatType;
     use easytier::proto::rpc_impl::bidirect::BidirectRpcManager;
     use easytier::proto::rpc_types::controller::BaseController;
@@ -448,6 +576,38 @@ mod manager {
     use easytier::rpc_service::remote_client::PersistentConfig;
     use easytier::tunnel::ring::RingTunnelConnector;
     use easytier::tunnel::TunnelConnector;
+    use easytier::web_client::WebClientHooks;
+
+    pub(super) struct GuiHooks {
+        pub(super) app: AppHandle,
+    }
+
+    #[async_trait]
+    impl WebClientHooks for GuiHooks {
+        async fn pre_run_network_instance(
+            &self,
+            cfg: &easytier::common::config::TomlConfigLoader,
+        ) -> Result<(), String> {
+            let client_manager = get_client_manager!()?;
+            client_manager
+                .pre_run_network_instance_hook(&self.app, cfg)
+                .await
+        }
+
+        async fn post_run_network_instance(&self, instance_id: &uuid::Uuid) -> Result<(), String> {
+            let client_manager = get_client_manager!()?;
+            client_manager
+                .post_run_network_instance_hook(&self.app, instance_id)
+                .await
+        }
+
+        async fn post_remove_network_instances(&self, ids: &[uuid::Uuid]) -> Result<(), String> {
+            let client_manager = get_client_manager!()?;
+            client_manager
+                .post_remove_network_instances_hook(&self.app, ids)
+                .await
+        }
+    }
 
     #[derive(Clone)]
     pub(super) struct GUIConfig(String, pub(crate) NetworkConfig);
@@ -637,7 +797,8 @@ mod manager {
             app: &AppHandle,
         ) -> Result<(), easytier::rpc_service::remote_client::RemoteClientError<anyhow::Error>>
         {
-            for inst_id in self.get_enabled_instances_with_tun_ids() {
+            let inst_ids: Vec<uuid::Uuid> = self.get_enabled_instances_with_tun_ids().collect();
+            for inst_id in inst_ids {
                 self.handle_update_network_state(app.clone(), inst_id, true)
                     .await?;
             }
@@ -650,6 +811,92 @@ mod manager {
                 app.emit("vpn_service_stop", "")
                     .map_err(|e| e.to_string())?;
             }
+            Ok(())
+        }
+
+        pub(super) async fn pre_run_network_instance_hook(
+            &self,
+            app: &AppHandle,
+            cfg: &easytier::common::config::TomlConfigLoader,
+        ) -> Result<(), String> {
+            let instance_id = cfg.get_id();
+            app.emit("pre_run_network_instance", instance_id)
+                .map_err(|e| e.to_string())?;
+
+            #[cfg(target_os = "android")]
+            if !cfg.get_flags().no_tun {
+                self.disable_instances_with_tun(app)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            self.storage
+                .save_config(
+                    app,
+                    instance_id,
+                    NetworkConfig::new_from_config(cfg).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+
+            Ok(())
+        }
+
+        pub(super) async fn post_run_network_instance_hook(
+            &self,
+            app: &AppHandle,
+            instance_id: &uuid::Uuid,
+        ) -> Result<(), String> {
+            #[cfg(target_os = "android")]
+            if let Some(instance_manager) = super::INSTANCE_MANAGER.read().await.as_ref() {
+                let instance_uuid = *instance_id;
+                if let Some(instance_ref) = instance_manager
+                    .iter()
+                    .find(|item| *item.key() == instance_uuid)
+                {
+                    if let Some(mut event_receiver) = instance_ref.value().subscribe_event() {
+                        let app_clone = app.clone();
+                        let instance_id_clone = *instance_id;
+                        tokio::spawn(async move {
+                            loop {
+                                match event_receiver.recv().await {
+                                    Ok(easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Changed(_, _)) => {
+                                        let _ = app_clone.emit("dhcp_ip_changed", instance_id_clone);
+                                    }
+                                    Ok(easytier::common::global_ctx::GlobalCtxEvent::ProxyCidrsUpdated(_, _)) => {
+                                        let _ = app_clone.emit("proxy_cidrs_updated", instance_id_clone);
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                        break;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        let _ = app_clone.emit("event_lagged", instance_id_clone);
+                                        event_receiver = event_receiver.resubscribe();
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            self.storage.enabled_networks.insert(*instance_id);
+
+            app.emit("post_run_network_instance", instance_id)
+                .map_err(|e| e.to_string())?;
+
+            Ok(())
+        }
+
+        pub(super) async fn post_remove_network_instances_hook(
+            &self,
+            app: &AppHandle,
+            _ids: &[uuid::Uuid],
+        ) -> Result<(), String> {
+            self.storage
+                .enabled_networks
+                .retain(|id| !_ids.contains(id));
+            self.notify_vpn_stop_if_no_tun(app)?;
             Ok(())
         }
 
@@ -697,12 +944,6 @@ mod manager {
             let client = self
                 .get_rpc_client(app.clone())
                 .ok_or_else(|| anyhow::anyhow!("RPC client not found"))?;
-            let running_instances = client
-                .list_network_instance(BaseController::default(), ListNetworkInstanceRequest {})
-                .await?;
-            for id in running_instances.inst_ids {
-                self.storage.enabled_networks.insert(id.into());
-            }
             for id in enabled_networks {
                 if let Ok(uuid) = id.parse() {
                     if !self.storage.enabled_networks.contains(&uuid) {
@@ -763,10 +1004,11 @@ mod service {
         pub(super) rpc_portal: String,
         pub(super) file_log_level: String,
         pub(super) file_log_dir: String,
+        pub(super) config_server: Option<String>,
     }
     impl ServiceOptions {
         fn to_args_vec(&self) -> Vec<std::ffi::OsString> {
-            vec![
+            let mut args = vec![
                 "--config-dir".into(),
                 self.config_dir.clone().into(),
                 "--rpc-portal".into(),
@@ -776,7 +1018,14 @@ mod service {
                 "--file-log-dir".into(),
                 self.file_log_dir.clone().into(),
                 "--daemon".into(),
-            ]
+            ];
+
+            if let Some(config_server) = &self.config_server {
+                args.push("--config-server".into());
+                args.push(config_server.clone().into());
+            }
+
+            args
         }
     }
 
@@ -857,7 +1106,7 @@ pub fn run_gui() -> std::process::ExitCode {
     let app = builder
         .setup(|app| {
             // for logging config
-            let Ok(log_dir) = app.path().app_log_dir() else {
+            let Ok(log_dir) = get_log_dir(app.app_handle()) else {
                 return Ok(());
             };
             let config = LoggingConfigBuilder::default()
@@ -892,7 +1141,7 @@ pub fn run_gui() -> std::process::ExitCode {
                 .icon(tauri::image::Image::from_bytes(include_bytes!(
                     "../icons/icon.png"
                 ))?)
-                .icon_as_template(false)
+                .icon_as_template(true)
                 .build(app)?;
 
             Ok(())
@@ -919,11 +1168,15 @@ pub fn run_gui() -> std::process::ExitCode {
             get_service_status,
             init_rpc_connection,
             is_client_running,
+            init_web_client,
+            is_web_client_connected,
+            get_log_dir_path,
         ])
         .on_window_event(|_win, event| match event {
             #[cfg(not(target_os = "android"))]
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = _win.hide();
+                let _ = set_dock_visibility(_win.app_handle().clone(), false);
                 api.prevent_close();
             }
             _ => {}
@@ -931,19 +1184,7 @@ pub fn run_gui() -> std::process::ExitCode {
         .build(tauri::generate_context!())
         .unwrap();
 
-    #[cfg(not(target_os = "macos"))]
     app.run(|_app, _event| {});
-
-    #[cfg(target_os = "macos")]
-    {
-        use tauri::RunEvent;
-        app.run(|app, event| match event {
-            RunEvent::Reopen { .. } => {
-                toggle_window_visibility(app);
-            }
-            _ => {}
-        });
-    }
 
     std::process::ExitCode::SUCCESS
 }

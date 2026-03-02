@@ -16,6 +16,7 @@ pub mod config;
 pub mod constants;
 pub mod defer;
 pub mod dns;
+pub mod env_parser;
 pub mod error;
 pub mod global_ctx;
 pub mod idn;
@@ -119,7 +120,7 @@ pub fn get_machine_id() -> uuid::Uuid {
 
     #[cfg(any(
         target_os = "linux",
-        target_os = "macos",
+        all(target_os = "macos", not(feature = "macos-ne")),
         target_os = "windows",
         target_os = "freebsd"
     ))]
@@ -136,7 +137,7 @@ pub fn get_machine_id() -> uuid::Uuid {
 
     #[cfg(not(any(
         target_os = "linux",
-        target_os = "macos",
+        all(target_os = "macos", not(feature = "macos-ne")),
         target_os = "windows",
         target_os = "freebsd"
     )))]

@@ -11,6 +11,7 @@ interface ServiceOptions {
   rpc_portal: string
   file_log_level: string
   file_log_dir: string
+  config_server?: string
 }
 
 export type ServiceStatus = "Running" | "Stopped" | "NotInstalled"
@@ -67,9 +68,9 @@ export async function getConfig(instanceId: string) {
   return await invoke<NetworkConfig>('get_config', { instanceId })
 }
 
-export async function sendConfigs() {
+export async function sendConfigs(enabledNetworks: string[]) {
   let networkList: NetworkConfig[] = JSON.parse(localStorage.getItem('networkList') || '[]');
-  return await invoke('load_configs', { configs: networkList, enabledNetworks: [] })
+  return await invoke('load_configs', { configs: networkList, enabledNetworks })
 }
 
 export async function getNetworkMetas(instanceIds: string[]) {
@@ -88,10 +89,18 @@ export async function getServiceStatus() {
   return await invoke<ServiceStatus>('get_service_status')
 }
 
-export async function initRpcConnection(url?: string) {
-  return await invoke('init_rpc_connection', { url })
+export async function initRpcConnection(isNormalMode: boolean, url?: string) {
+  return await invoke('init_rpc_connection', { isNormalMode, url })
 }
 
 export async function isClientRunning() {
   return await invoke<boolean>('is_client_running')
+}
+
+export async function initWebClient(url?: string) {
+  return await invoke('init_web_client', { url })
+}
+
+export async function isWebClientConnected() {
+  return await invoke<boolean>('is_web_client_connected')
 }

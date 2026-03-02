@@ -130,7 +130,10 @@ proxy_forward_by_system: 系统转发
 proxy_forward_by_system_help: 通过系统内核转发子网代理数据包，禁用内置NAT
 
 disable_encryption: 禁用加密
-disable_encryption_help: 禁用对等节点通信的加密，默认为false，必须与对等节点相同
+disable_encryption_help: 禁用对等节点通信的加密。注意：默认启用加密，若勾选此项则关闭，必须与对等节点设置一致。
+
+disable_tcp_hole_punching: 禁用TCP打洞
+disable_tcp_hole_punching_help: 禁用TCP打洞功能
 
 disable_udp_hole_punching: 禁用UDP打洞
 disable_udp_hole_punching_help: 禁用UDP打洞功能
@@ -225,6 +228,7 @@ event:
   DhcpIpv4Changed: DHCP IPv4地址更改
   DhcpIpv4Conflicted: DHCP IPv4地址冲突
   PortForwardAdded: 端口转发添加
+  ProxyCidrsUpdated: 子网代理CIDR更新
 
 web:
   login:
@@ -330,6 +334,8 @@ web:
     success: 成功
     warning: 警告
     info: 提示
+    enable: 开启
+    disable: 关闭
 
   settings:
     title: 设置
@@ -346,6 +352,8 @@ mode:
   switch_mode: 切换模式
   config_dir: 配置目录
   rpc_portal: RPC端口
+  enable_rpc_tcp_listen: 开启 RPC 端口监听（TCP）
+  rpc_listen_port: RPC 监听端口
   log_level: 日志级别
   log_dir: 日志目录
   remote_rpc_address: 远程RPC地址
@@ -366,6 +374,23 @@ mode:
   stop_service_success: 服务停止成功
   remote_rpc_address_empty: 远程RPC地址不能为空
   service_config_empty: 服务配置不能为空
+  rpc_connection_failed: "RPC 连接失败：{error}"
+
+config-server:
+  title: 配置服务器
+  address: 配置服务器地址
+  address_placeholder: 例如：udp://127.0.0.1:22020/admin 或 admin
+  description: |
+    配置服务器地址，支持以下格式：
+    完整URL：udp://127.0.0.1:22020/admin
+    仅用户名：admin（使用官方服务器）
+    留空：不连接配置服务器
+  connection_status: 连接状态
+  connected: ": 已连接"
+  disconnected: ": 未连接"
+  connecting: ": 连接中..."
+  unknown: ""
+  update_service_confirm: 将重启服务以应用更改，是否继续？
 
 client:
   not_running: 无法连接至远程客户端
