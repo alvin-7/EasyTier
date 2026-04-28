@@ -34,7 +34,7 @@ fn set_error_msg(msg: &str) {
 
 /// # Safety
 /// Set the tun fd
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn set_tun_fd(
     inst_name: *const std::ffi::c_char,
     fd: std::ffi::c_int,
@@ -63,7 +63,7 @@ pub unsafe extern "C" fn set_tun_fd(
 
 /// # Safety
 /// Get the last error message
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_error_msg(out: *mut *const std::ffi::c_char) {
     let msg_buf = ERROR_MSG.lock().unwrap();
     if msg_buf.is_empty() {
@@ -78,7 +78,7 @@ pub unsafe extern "C" fn get_error_msg(out: *mut *const std::ffi::c_char) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn free_string(s: *const std::ffi::c_char) {
     if s.is_null() {
         return;
@@ -90,7 +90,7 @@ pub extern "C" fn free_string(s: *const std::ffi::c_char) {
 
 /// # Safety
 /// Parse the config
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn parse_config(cfg_str: *const std::ffi::c_char) -> std::ffi::c_int {
     let cfg_str = unsafe {
         assert!(!cfg_str.is_null());
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn parse_config(cfg_str: *const std::ffi::c_char) -> std::
 
 /// # Safety
 /// Run the network instance
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn run_network_instance(cfg_str: *const std::ffi::c_char) -> std::ffi::c_int {
     let cfg_str = unsafe {
         assert!(!cfg_str.is_null());
@@ -148,7 +148,7 @@ pub unsafe extern "C" fn run_network_instance(cfg_str: *const std::ffi::c_char) 
 
 /// # Safety
 /// Retain the network instance
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn retain_network_instance(
     inst_names: *const *const std::ffi::c_char,
     length: usize,
@@ -192,7 +192,7 @@ pub unsafe extern "C" fn retain_network_instance(
 
 /// # Safety
 /// Collect the network infos
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn collect_network_infos(
     infos: *mut KeyValuePair,
     max_length: usize,
@@ -219,7 +219,7 @@ pub unsafe extern "C" fn collect_network_infos(
         if index >= max_length {
             break;
         }
-        let Some(key) = INSTANCE_MANAGER.get_network_instance_name(instance_id) else {
+        let Some(key) = INSTANCE_MANAGER.get_instance_name(instance_id) else {
             continue;
         };
         // convert value to json string
@@ -232,7 +232,7 @@ pub unsafe extern "C" fn collect_network_infos(
         };
 
         infos[index] = KeyValuePair {
-            key: std::ffi::CString::new(key.clone()).unwrap().into_raw(),
+            key: std::ffi::CString::new(key).unwrap().into_raw(),
             value: std::ffi::CString::new(value).unwrap().into_raw(),
         };
         index += 1;

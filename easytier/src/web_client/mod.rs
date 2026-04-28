@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     common::{
-        config::TomlConfigLoader, global_ctx::GlobalCtx, scoped_task::ScopedTask,
+        config::TomlConfigLoader, global_ctx::GlobalCtx, log, os_info::collect_device_os_info,
         set_default_machine_id, stun::MockStunInfoCollector,
     },
     connector::create_connector_by_url,
@@ -12,6 +12,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
+use tokio_util::task::AbortOnDropHandle;
 use url::Url;
 use uuid::Uuid;
 
@@ -36,13 +37,14 @@ pub struct DefaultHooks;
 impl WebClientHooks for DefaultHooks {}
 
 pub mod controller;
+pub mod security;
 pub mod session;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct WebClient {
     controller: Arc<controller::Controller>,
-    tasks: ScopedTask<()>,
+    tasks: AbortOnDropHandle<()>,
     manager_guard: DaemonGuard,
     connected: Arc<AtomicBool>,
 }
@@ -52,6 +54,7 @@ impl WebClient {
         connector: T,
         token: S,
         hostname: H,
+        secure_mode: bool,
         manager: Arc<NetworkInstanceManager>,
         hooks: Option<Arc<dyn WebClientHooks>>,
     ) -> Self {
@@ -60,6 +63,7 @@ impl WebClient {
         let controller = Arc::new(controller::Controller::new(
             token.to_string(),
             hostname.to_string(),
+            collect_device_os_info(),
             manager,
             hooks,
         ));
@@ -67,8 +71,14 @@ impl WebClient {
 
         let controller_clone = controller.clone();
         let connected_clone = connected.clone();
-        let tasks = ScopedTask::from(tokio::spawn(async move {
-            Self::routine(controller_clone, connected_clone, Box::new(connector)).await;
+        let tasks = AbortOnDropHandle::new(tokio::spawn(async move {
+            Self::routine(
+                controller_clone,
+                connected_clone,
+                secure_mode,
+                Box::new(connector),
+            )
+            .await;
         }));
 
         WebClient {
@@ -82,25 +92,103 @@ impl WebClient {
     async fn routine(
         controller: Arc<controller::Controller>,
         connected: Arc<AtomicBool>,
+        secure_mode: bool,
         mut connector: Box<dyn TunnelConnector>,
     ) {
         loop {
             let conn = match connector.connect().await {
                 Ok(conn) => conn,
-                Err(e) => {
-                    println!(
-                        "Failed to connect to the server ({}), retrying in 5 seconds...",
-                        e
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                Err(error) => {
+                    let wait = 1;
+                    log::warn!(%error, "Failed to connect to the server, retrying in {} seconds...", wait);
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     continue;
                 }
             };
 
             connected.store(true, Ordering::Release);
-            println!("Successfully connected to {:?}", conn.info());
+            log::info!("Successfully connected to {:?}", conn.info());
 
             let mut session = session::Session::new(conn, controller.clone());
+            let support_encryption = match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                session.get_feature(),
+            )
+            .await
+            {
+                Ok(Ok(feature)) => feature.support_encryption,
+                Ok(Err(error)) => {
+                    log::warn!(%error, "GetFeature rpc failed, fallback to legacy tunnel");
+                    false
+                }
+                Err(_) => {
+                    log::warn!("GetFeature rpc timeout, fallback to legacy tunnel");
+                    false
+                }
+            };
+
+            if support_encryption && security::web_secure_tunnel_supported() {
+                log::info!("Server supports encryption, reconnecting with secure tunnel");
+                drop(session);
+
+                let conn = match connector.connect().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        connected.store(false, Ordering::Release);
+                        let wait = 1;
+                        log::warn!(%error, "Failed to reconnect secure tunnel, retrying in {} seconds...", wait);
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                };
+
+                let conn = match security::upgrade_client_tunnel(conn).await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        connected.store(false, Ordering::Release);
+                        let wait = 1;
+                        log::warn!(%error, "Noise handshake failed, retrying in {} seconds...", wait);
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                };
+
+                let mut session = session::Session::new(conn, controller.clone());
+                session.start_heartbeat().await;
+                session.wait().await;
+                connected.store(false, Ordering::Release);
+                continue;
+            }
+
+            if support_encryption {
+                if secure_mode {
+                    connected.store(false, Ordering::Release);
+                    let wait = 1;
+                    log::warn!(
+                        "secure-mode enabled but local build lacks aes-gcm support for web secure tunnel, retrying in {} seconds...",
+                        wait
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+
+                log::warn!(
+                    "Server supports encryption but local build lacks aes-gcm support for web secure tunnel, falling back to legacy tunnel"
+                );
+            }
+
+            if secure_mode {
+                connected.store(false, Ordering::Release);
+                let wait = 1;
+                log::warn!(
+                    "secure-mode enabled but server does not support encryption, retrying in {} seconds...",
+                    wait
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                continue;
+            }
+
+            session.start_heartbeat().await;
             session.wait().await;
             connected.store(false, Ordering::Release);
         }
@@ -115,6 +203,7 @@ pub async fn run_web_client(
     config_server_url_s: &str,
     machine_id: Option<String>,
     hostname: Option<String>,
+    secure_mode: bool,
     manager: Arc<NetworkInstanceManager>,
     hooks: Option<Arc<dyn WebClientHooks>>,
 ) -> Result<WebClient> {
@@ -130,10 +219,12 @@ pub async fn run_web_client(
     };
 
     let mut c_url = config_server_url.clone();
-    c_url.set_path("");
+    if !matches!(c_url.scheme(), "ws" | "wss") {
+        c_url.set_path("");
+    }
     let token = config_server_url
         .path_segments()
-        .and_then(|mut x| x.next())
+        .and_then(|mut x| x.next_back())
         .map(|x| percent_encoding::percent_decode_str(x).decode_utf8())
         .transpose()
         .with_context(|| "failed to decode config server token")?
@@ -160,6 +251,7 @@ pub async fn run_web_client(
         create_connector_by_url(c_url.as_str(), &global_ctx, IpVersion::Both).await?,
         token.to_string(),
         hostname,
+        secure_mode,
         manager.clone(),
         hooks,
     ))
@@ -167,7 +259,7 @@ pub async fn run_web_client(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::{Arc, atomic::AtomicBool};
 
     use crate::instance_manager::NetworkInstanceManager;
 
@@ -178,6 +270,7 @@ mod tests {
             format!("ring://{}/test", uuid::Uuid::new_v4()).as_str(),
             None,
             None,
+            false,
             manager.clone(),
             None,
         )
